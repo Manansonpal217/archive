@@ -1,0 +1,9 @@
+node_modules/
+venv/
+.env
+.env.*
+*.log
+.DS_Store
+out/
+dist/
+*.asar
