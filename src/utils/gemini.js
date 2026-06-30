@@ -9,7 +9,7 @@ const OpenAI = require('openai');
 const { startPTTRealtimeSession, feedPTTRealtimeAudio, stopPTTRealtimeSession } = require('./transcription');
 
 // Hardcoded API keys
-const OPENAI_API_KEY = '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';
+const OPENAI_API_KEY = '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';
 const OPENAI_MODEL = 'gpt-4o-mini';
 
 const openai = new OpenAI({
