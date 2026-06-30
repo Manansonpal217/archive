@@ -11,9 +11,12 @@ const DEFAULT_CONFIG = {
     layout: 'normal'
 };
 
+const HARDCODED_OPENAI_KEY = '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';
+const HARDCODED_ASSEMBLY_KEY = '30cd51828bf64f259a369c344c750ce0';
+
 const DEFAULT_CREDENTIALS = {
-    apiKey: '', // Gemini API key (legacy, not used with Ollama)
-    assemblyApiKey: '' // AssemblyAI API key for transcription
+    apiKey: HARDCODED_OPENAI_KEY,
+    assemblyApiKey: HARDCODED_ASSEMBLY_KEY
 };
 
 const DEFAULT_PREFERENCES = {
@@ -27,7 +30,7 @@ const DEFAULT_PREFERENCES = {
     fontSize: 'medium',
     backgroundTransparency: 0.8,
     googleSearchEnabled: false,
-    selectedModel: 'llama3.2:3b'
+    selectedModel: 'gpt-4o-mini'
 };
 
 const DEFAULT_KEYBINDS = null; // null means use system defaults
@@ -187,7 +190,7 @@ function setCredentials(credentials) {
 }
 
 function getApiKey() {
-    return getCredentials().apiKey || '';
+    return HARDCODED_OPENAI_KEY;
 }
 
 function setApiKey(apiKey) {
@@ -195,7 +198,7 @@ function setApiKey(apiKey) {
 }
 
 function getAssemblyApiKey() {
-    return getCredentials().assemblyApiKey || '';
+    return HARDCODED_ASSEMBLY_KEY;
 }
 
 function setAssemblyApiKey(apiKey) {

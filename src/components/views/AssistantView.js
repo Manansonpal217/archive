@@ -14,7 +14,8 @@ export class AssistantView extends LitElement {
         }
 
         .response-container {
-            height: calc(100% - 50px);
+            flex: 1;
+            min-height: 0;
             overflow-y: auto;
             font-size: var(--response-font-size, 16px);
             line-height: 1.6;
@@ -153,6 +154,49 @@ export class AssistantView extends LitElement {
 
         .response-container::-webkit-scrollbar-thumb:hover {
             background: var(--scrollbar-thumb-hover);
+        }
+
+        .ptt-live-strip {
+            flex-shrink: 0;
+            padding: 8px 12px;
+            border-bottom: 1px solid var(--border-color);
+            background: var(--bg-secondary);
+            font-size: 12px;
+            color: var(--text-secondary);
+            line-height: 1.45;
+            max-height: 72px;
+            overflow-y: auto;
+        }
+
+        .ptt-live-strip .ptt-live-heading {
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            opacity: 0.65;
+            margin-bottom: 4px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .ptt-live-strip .live-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: rgb(239, 68, 68);
+            animation: pttPulse 1.2s ease-in-out infinite;
+        }
+
+        @keyframes pttPulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.35; }
+        }
+
+        .ptt-live-strip .ptt-live-body {
+            color: var(--text-color);
+            font-size: 13px;
+            white-space: pre-wrap;
+            word-break: break-word;
         }
 
         .text-input-container {
@@ -314,6 +358,49 @@ export class AssistantView extends LitElement {
             opacity: 0.5;
             font-size: 10px;
         }
+
+        .ptt-btn {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            background: transparent;
+            color: var(--text-secondary);
+            border: 1px solid var(--border-color);
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 0.1s ease, border-color 0.1s ease, color 0.1s ease, box-shadow 0.1s ease;
+            white-space: nowrap;
+            user-select: none;
+            -webkit-user-select: none;
+            touch-action: none;
+        }
+
+        .ptt-btn:hover {
+            border-color: var(--text-secondary);
+            color: var(--text-color);
+        }
+
+        .ptt-btn.recording {
+            background: rgba(239, 68, 68, 0.15);
+            border-color: rgb(239, 68, 68);
+            color: rgb(239, 68, 68);
+            box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.2);
+        }
+
+        .ptt-btn.processing {
+            opacity: 0.65;
+            cursor: wait;
+            pointer-events: none;
+        }
+
+        .ptt-btn svg {
+            width: 14px;
+            height: 14px;
+            flex-shrink: 0;
+        }
     `;
 
     static properties = {
@@ -324,6 +411,8 @@ export class AssistantView extends LitElement {
         shouldAnimateResponse: { type: Boolean },
         flashCount: { type: Number },
         flashLiteCount: { type: Number },
+        pttPhase: { type: String },
+        pttLiveText: { type: String },
     };
 
     constructor() {
@@ -334,6 +423,10 @@ export class AssistantView extends LitElement {
         this.onSendText = () => {};
         this.flashCount = 0;
         this.flashLiteCount = 0;
+        this.pttPhase = 'idle';
+        this.pttLiveText = '';
+        /** @type {Promise<any>|null} */
+        this._pttStartPromise = null;
     }
 
     getProfileNames() {
@@ -482,6 +575,15 @@ export class AssistantView extends LitElement {
             ipcRenderer.on('navigate-next-response', this.handleNextResponse);
             ipcRenderer.on('scroll-response-up', this.handleScrollUp);
             ipcRenderer.on('scroll-response-down', this.handleScrollDown);
+
+            this.handlePttLiveTranscript = (_evt, data) => {
+                this.pttLiveText = typeof data?.text === 'string' ? data.text : '';
+            };
+            this.handlePttLiveClear = () => {
+                this.pttLiveText = '';
+            };
+            ipcRenderer.on('ptt-live-transcript', this.handlePttLiveTranscript);
+            ipcRenderer.on('ptt-live-transcript-clear', this.handlePttLiveClear);
         }
     }
 
@@ -503,6 +605,12 @@ export class AssistantView extends LitElement {
             if (this.handleScrollDown) {
                 ipcRenderer.removeListener('scroll-response-down', this.handleScrollDown);
             }
+            if (this.handlePttLiveTranscript) {
+                ipcRenderer.removeListener('ptt-live-transcript', this.handlePttLiveTranscript);
+            }
+            if (this.handlePttLiveClear) {
+                ipcRenderer.removeListener('ptt-live-transcript-clear', this.handlePttLiveClear);
+            }
         }
     }
 
@@ -519,6 +627,45 @@ export class AssistantView extends LitElement {
         if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
             this.handleSendText();
+        }
+    }
+
+    async handlePTTStart(e) {
+        if (this.pttPhase !== 'idle') return;
+        e.currentTarget.setPointerCapture(e.pointerId);
+        this.pttPhase = 'recording';
+        this.pttLiveText = '';
+        this._pttStartPromise = window.cheatingDaddy.startPTT();
+        const result = await this._pttStartPromise;
+        this._pttStartPromise = null;
+        if (!result?.success) {
+            try {
+                e.currentTarget.releasePointerCapture(e.pointerId);
+            } catch (_) {
+                /* ignore */
+            }
+            this.pttPhase = 'idle';
+        }
+    }
+
+    async handlePTTStop(e) {
+        if (this.pttPhase !== 'recording') return;
+        try {
+            if (e.pointerId != null) {
+                e.currentTarget.releasePointerCapture(e.pointerId);
+            }
+        } catch (_) {
+            /* ignore */
+        }
+        this.pttPhase = 'processing';
+        try {
+            if (this._pttStartPromise) {
+                await this._pttStartPromise;
+            }
+            await window.cheatingDaddy.stopPTT();
+        } finally {
+            this._pttStartPromise = null;
+            this.pttPhase = 'idle';
         }
     }
 
@@ -587,8 +734,25 @@ export class AssistantView extends LitElement {
 
     render() {
         const responseCounter = this.getResponseCounter();
+        const showLiveStrip =
+            this.pttPhase !== 'idle' || (this.pttLiveText && this.pttLiveText.trim().length > 0);
+        const liveBody =
+            this.pttLiveText.trim().length > 0
+                ? this.pttLiveText
+                : this.pttPhase === 'recording'
+                  ? 'Listening…'
+                  : this.pttPhase === 'processing'
+                    ? 'Finishing transcription…'
+                    : '';
 
         return html`
+            <div class="ptt-live-strip" ?hidden=${!showLiveStrip}>
+                ${this.pttPhase === 'recording'
+                    ? html`<div class="ptt-live-heading"><span class="live-dot"></span>Live transcript</div>`
+                    : ''}
+                <div class="ptt-live-body">${liveBody}</div>
+            </div>
+
             <div class="response-container" id="responseContainer"></div>
 
             <div class="text-input-container">
@@ -607,6 +771,25 @@ export class AssistantView extends LitElement {
                 </button>
 
                 <input type="text" id="textInput" placeholder="Type a message to the AI..." @keydown=${this.handleTextKeydown} />
+
+                <button
+                    class="ptt-btn ${this.pttPhase === 'recording' ? 'recording' : ''} ${this.pttPhase === 'processing' ? 'processing' : ''}"
+                    ?disabled=${this.pttPhase === 'processing'}
+                    @pointerdown=${this.handlePTTStart}
+                    @pointerup=${this.handlePTTStop}
+                    @pointercancel=${this.handlePTTStop}
+                >
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
+                        <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                        <line x1="12" y1="19" x2="12" y2="22"/>
+                    </svg>
+                    ${this.pttPhase === 'recording'
+                        ? 'Recording…'
+                        : this.pttPhase === 'processing'
+                          ? 'Sending…'
+                          : 'Hold to talk'}
+                </button>
 
                 <div class="screen-answer-btn-wrapper">
                     <div class="tooltip">

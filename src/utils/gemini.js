@@ -1,19 +1,37 @@
-const { GoogleGenAI, Modality } = require('@google/genai');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { BrowserWindow, ipcMain } = require('electron');
 const { spawn } = require('child_process');
-const { saveDebugAudio } = require('../audioUtils');
+const { saveDebugAudio, pcmToWavBuffer } = require('../audioUtils');
 const { getSystemPrompt } = require('./prompts');
-const { getAvailableModel, incrementLimitCount, getApiKey } = require('../storage');
-const {
-    startSystemAudioTranscription,
-    startMicAudioTranscription,
-    stopSystemAudioTranscription,
-    stopMicAudioTranscription,
-    stopAllTranscription,
-    processAudioChunk,
-    getSystemAudioTranscription,
-    getMicAudioTranscription
-} = require('./transcription');
+const OpenAI = require('openai');
+const { startPTTRealtimeSession, feedPTTRealtimeAudio, stopPTTRealtimeSession } = require('./transcription');
+
+// Hardcoded API keys
+const OPENAI_API_KEY = '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';
+const OPENAI_MODEL = 'gpt-4o-mini';
+
+const openai = new OpenAI({
+    apiKey: OPENAI_API_KEY,
+    timeout: 600000, // 10m — vision requests can be slow; connect phase still bounded by retries
+    maxRetries: 3,
+});
+
+/** PCM mono chunks @ 24kHz while PTT held (system audio only). */
+let pttAudioChunks = [];
+let isPTTRecording = false;
+
+/** Drops overlapping vision uploads (e.g. key-repeat on next-step shortcut). */
+let sendImageContentLocked = false;
+
+/** Serialize ptt-start / ptt-release so rapid taps cannot reorder IPC. */
+let pttChain = Promise.resolve();
+function runPttSequential(fn) {
+    const next = pttChain.then(fn);
+    pttChain = next.catch(() => {});
+    return next;
+}
 
 // Conversation tracking variables
 let currentSessionId = null;
@@ -24,12 +42,8 @@ let currentProfile = null;
 let currentCustomPrompt = null;
 let isInitializingSession = false;
 
-// Conversation context for Ollama
-let conversationContext = []; // Stores conversation history for context
-
-// Ollama configuration
-const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || 'http://localhost:11434';
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'llama3.2:3b'; // Default model
+// Conversation context (OpenAI message format)
+let conversationContext = [];
 
 function formatSpeakerResults(results) {
     let text = '';
@@ -219,71 +233,20 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
     }
 
     try {
-    // Get enabled tools first to determine Google Search status
-    const enabledTools = await getEnabledTools();
-    const googleSearchEnabled = enabledTools.some(tool => tool.googleSearch);
+        const enabledTools = await getEnabledTools();
+        const googleSearchEnabled = enabledTools.some(tool => tool.googleSearch);
+        const systemPrompt = getSystemPrompt(profile, customPrompt, googleSearchEnabled);
 
-    const systemPrompt = getSystemPrompt(profile, customPrompt, googleSearchEnabled);
-
-        // Initialize new conversation session only on first connect
         if (!isReconnect) {
             initializeNewSession(profile, customPrompt);
-            // Store system prompt in conversation context (for Ollama)
+            // Initialize conversation context with system prompt (OpenAI format)
             conversationContext = [
-                {
-                    role: 'user',
-                    parts: [{ text: systemPrompt }]
-                },
-                {
-                    role: 'model',
-                    parts: [{ text: 'Understood. I\'m ready to help.' }]
-                }
+                { role: 'system', content: systemPrompt }
             ];
-            
-            // Start transcription streams
-            startSystemAudioTranscription();
-            startMicAudioTranscription();
         }
 
-        // Check if Ollama is accessible
-        const http = require('http');
-        const https = require('https');
-        const url = require('url');
-        const parsedUrl = url.parse(OLLAMA_BASE_URL);
-        const isHttps = parsedUrl.protocol === 'https:';
-        const httpModule = isHttps ? https : http;
-        
-        await new Promise((resolve, reject) => {
-            const req = httpModule.request({
-                hostname: parsedUrl.hostname,
-                port: parsedUrl.port || (isHttps ? 443 : 11434),
-                path: '/api/tags',
-                method: 'GET',
-                timeout: 5000
-            }, (res) => {
-                res.on('data', () => {}); // Consume response
-                res.on('end', resolve);
-            });
-
-            req.on('error', (error) => {
-                reject(new Error(`Cannot connect to Ollama at ${OLLAMA_BASE_URL}. Error: ${error.message}. Make sure Ollama is running or the URL is correct.`));
-            });
-
-            req.on('timeout', () => {
-                req.destroy();
-                reject(new Error(`Connection to Ollama timed out at ${OLLAMA_BASE_URL}`));
-            });
-
-            req.end();
-        });
-
-        // Get selected model from preferences
-        const prefs = require('../storage').getPreferences();
-        const selectedModel = prefs.selectedModel || OLLAMA_MODEL;
-
-        console.log('=== Ollama Session Initialized ===');
-        console.log('[Model]:', selectedModel);
-        console.log('[Ollama URL]:', OLLAMA_BASE_URL);
+        console.log('=== OpenAI Session Initialized ===');
+        console.log('[Model]:', OPENAI_MODEL);
         console.log('[Profile]:', profile);
         console.log('[Language]:', language);
 
@@ -291,10 +254,10 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
         if (!isReconnect) {
             sendToRenderer('session-initializing', false);
         }
-        sendToRenderer('update-status', 'Session ready - Ollama');
-        return { type: 'ollama', context: conversationContext };
+        sendToRenderer('update-status', 'Session ready - OpenAI');
+        return { type: 'openai', context: conversationContext };
     } catch (error) {
-        console.error('Failed to initialize Ollama session:', error);
+        console.error('Failed to initialize OpenAI session:', error);
         isInitializingSession = false;
         if (!isReconnect) {
             sendToRenderer('session-initializing', false);
@@ -401,12 +364,8 @@ async function startMacOSAudioCapture(geminiSessionRef) {
     await killExistingSystemAudioDump();
 
     console.log('Starting macOS audio capture with SystemAudioDump...');
-    
-    // Start transcription for system audio
-    startSystemAudioTranscription();
 
     const { app } = require('electron');
-    const path = require('path');
 
     let systemAudioPath;
     if (app.isPackaged) {
@@ -449,9 +408,11 @@ async function startMacOSAudioCapture(geminiSessionRef) {
             audioBuffer = audioBuffer.slice(CHUNK_SIZE);
 
             const monoChunk = CHANNELS === 2 ? convertStereoToMono(chunk) : chunk;
-            
-            // Send to transcription service
-            processAudioChunk(monoChunk, 'system');
+
+            if (isPTTRecording) {
+                pttAudioChunks.push(monoChunk);
+                feedPTTRealtimeAudio(monoChunk);
+            }
 
             if (process.env.DEBUG_AUDIO) {
                 console.log(`Processed audio chunk: ${chunk.length} bytes`);
@@ -510,235 +471,110 @@ async function sendAudioToGemini(base64Data, geminiSessionRef) {
     console.warn('sendAudioToGemini called but audio mode not supported in text-only API');
 }
 
-// Send text message to Ollama (cloud model support)
 async function sendTextToGemini(text, model = null) {
-    // Get model from preferences if not provided
-    let modelName = model;
-    if (!modelName) {
-        try {
-            const prefs = require('../storage').getPreferences();
-            modelName = prefs.selectedModel || OLLAMA_MODEL;
-        } catch (error) {
-            modelName = OLLAMA_MODEL;
-        }
-    }
-    const http = require('http');
-    const https = require('https');
-    const url = require('url');
-    
+    const modelName = model || OPENAI_MODEL;
+
     try {
-        console.log(`=== Ollama Text API Call ===`);
+        console.log(`=== OpenAI Text API Call ===`);
         console.log(`[Model]: ${modelName}`);
         console.log(`[Input]: ${text}`);
-        console.log(`[Ollama URL]: ${OLLAMA_BASE_URL}`);
 
-        // Build conversation history for Ollama (convert from Gemini format)
-        const messages = [];
-        for (let i = 0; i < conversationContext.length; i++) {
-            const msg = conversationContext[i];
-            if (msg.role === 'user') {
-                messages.push({
-                    role: 'user',
-                    content: msg.parts[0].text
-                });
-            } else if (msg.role === 'model') {
-                messages.push({
-                    role: 'assistant',
-                    content: msg.parts[0].text
-                });
-            }
-        }
-        
-        // Add current message
-        messages.push({
-            role: 'user',
-            content: text
-        });
+        const messages = [...conversationContext, { role: 'user', content: text }];
 
-        // Prepare request to Ollama
-        const requestData = JSON.stringify({
+        const stream = await openai.chat.completions.create({
             model: modelName,
             messages: messages,
             stream: true
         });
 
-        const parsedUrl = url.parse(OLLAMA_BASE_URL);
-        const isHttps = parsedUrl.protocol === 'https:';
-        const httpModule = isHttps ? https : http;
-        
-        const options = {
-            hostname: parsedUrl.hostname,
-            port: parsedUrl.port || (isHttps ? 443 : 11434),
-            path: '/api/chat',
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(requestData)
-            }
-        };
-
-        // Stream the response from Ollama
         let fullText = '';
         let isFirst = true;
 
-        return new Promise((resolve, reject) => {
-            const req = httpModule.request(options, (res) => {
-                if (res.statusCode !== 200) {
-                    let errorBody = '';
-                    res.on('data', (chunk) => { errorBody += chunk; });
-                    res.on('end', () => {
-                        console.error(`Ollama API error ${res.statusCode}:`, errorBody);
-                        reject(new Error(`Ollama API error: ${res.statusCode} - ${errorBody || res.statusMessage}. Make sure the model "${modelName}" is available. Try: ollama pull ${modelName}`));
-                    });
-                    return;
-                }
-
-                res.setEncoding('utf8');
-                let buffer = '';
-
-                res.on('data', (chunk) => {
-                    buffer += chunk;
-                    const lines = buffer.split('\n');
-                    buffer = lines.pop() || ''; // Keep incomplete line in buffer
-
-                    for (const line of lines) {
-                        if (line.trim() === '') continue;
-                        try {
-                            const data = JSON.parse(line);
-                            if (data.message && data.message.content) {
-                                const chunkText = data.message.content;
-                                fullText += chunkText;
-                                // Send to renderer - new response for first chunk, update for subsequent
-                                sendToRenderer(isFirst ? 'new-response' : 'update-response', fullText);
-                                isFirst = false;
-                            }
-                            if (data.done) {
-                                console.log(`=== Ollama Response Complete ===`);
-                                console.log(`[Model]: ${modelName}`);
-                                console.log(`[Response]: ${fullText}`);
-
-                                // Update conversation context (Gemini format for compatibility)
-                                conversationContext.push({
-                                    role: 'user',
-                                    parts: [{ text: text }]
-                                });
-                                conversationContext.push({
-                                    role: 'model',
-                                    parts: [{ text: fullText }]
-                                });
-
-                                // Keep context manageable (last 20 messages)
-                                if (conversationContext.length > 40) {
-                                    conversationContext = conversationContext.slice(-40);
-                                }
-
-                                // Save conversation turn
-                                if (currentTranscription) {
-                                    saveConversationTurn(currentTranscription, fullText);
-                                    currentTranscription = '';
-                                } else {
-                                    saveConversationTurn(text, fullText);
-                                }
-
-                                resolve({ success: true, text: fullText, model: modelName });
-                            }
-                        } catch (e) {
-                            // Skip invalid JSON lines
-                        }
-                    }
-                });
-
-                res.on('end', () => {
-                    if (buffer.trim()) {
-                        try {
-                            const data = JSON.parse(buffer);
-                            if (data.message && data.message.content) {
-                                fullText += data.message.content;
-                                sendToRenderer(isFirst ? 'new-response' : 'update-response', fullText);
-                            }
-                        } catch (e) {
-                            // Ignore parse errors
-                        }
-                    }
-                });
-
-                res.on('error', (error) => {
-                    reject(error);
-                });
-            });
-
-            req.on('error', (error) => {
-                console.error('=== Ollama Connection Error ===');
-                console.error('[Error]:', error);
-                const errorMsg = error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED'
-                    ? `Failed to connect to Ollama at ${OLLAMA_BASE_URL}. Make sure Ollama is running or the URL is correct.`
-                    : `Connection error: ${error.message}`;
-                reject(new Error(errorMsg));
-            });
-
-            req.write(requestData);
-            req.end();
-        });
-    } catch (error) {
-        console.error('=== Ollama Text API Error ===');
-        console.error('[Error]:', error);
-        console.error('[Error Message]:', error.message);
-        return { success: false, error: error.message };
-    }
-}
-
-async function sendImageToGeminiHttp(base64Data, prompt) {
-    // Get available model based on rate limits
-    const model = getAvailableModel();
-
-    const apiKey = getApiKey();
-    if (!apiKey) {
-        return { success: false, error: 'No API key configured' };
-    }
-
-    try {
-        const ai = new GoogleGenAI({ apiKey: apiKey });
-
-        const contents = [
-            {
-                inlineData: {
-                    mimeType: 'image/jpeg',
-                    data: base64Data,
-                },
-            },
-            { text: prompt },
-        ];
-
-        console.log(`Sending image to ${model} (streaming)...`);
-        const response = await ai.models.generateContentStream({
-            model: model,
-            contents: contents,
-        });
-
-        // Increment count after successful call
-        incrementLimitCount(model);
-
-        // Stream the response
-        let fullText = '';
-        let isFirst = true;
-        for await (const chunk of response) {
-            const chunkText = chunk.text;
+        for await (const chunk of stream) {
+            const chunkText = chunk.choices[0]?.delta?.content || '';
             if (chunkText) {
                 fullText += chunkText;
-                // Send to renderer - new response for first chunk, update for subsequent
                 sendToRenderer(isFirst ? 'new-response' : 'update-response', fullText);
                 isFirst = false;
             }
         }
 
-        console.log(`Image response completed from ${model}`);
+        console.log(`=== OpenAI Response Complete ===`);
+        console.log(`[Model]: ${modelName}`);
+        console.log(`[Response]: ${fullText}`);
 
-        // Save screen analysis to history
-        saveScreenAnalysis(prompt, fullText, model);
+        conversationContext.push({ role: 'user', content: text });
+        conversationContext.push({ role: 'assistant', content: fullText });
 
-        return { success: true, text: fullText, model: model };
+        if (conversationContext.length > 40) {
+            // Always keep the system message at index 0
+            conversationContext = [conversationContext[0], ...conversationContext.slice(-39)];
+        }
+
+        if (currentTranscription) {
+            saveConversationTurn(currentTranscription, fullText);
+            currentTranscription = '';
+        } else {
+            saveConversationTurn(text, fullText);
+        }
+
+        return { success: true, text: fullText, model: modelName };
     } catch (error) {
-        console.error('Error sending image to Gemini HTTP:', error);
+        console.error('=== OpenAI Text API Error ===');
+        console.error('[Error]:', error.message);
+        return { success: false, error: error.message };
+    }
+}
+
+const DEFAULT_SCREEN_PROMPT = `Look at this screenshot carefully and identify any questions, problems, or tasks visible on screen. Then answer them directly and completely.
+
+- **MCQ / multiple choice**: State the correct option letter and a one-line reason.
+- **Coding question**: Give a brief approach (2-3 bullets), then the complete working code.
+- **Math / numerical**: Show the answer and the key steps.
+- **Written / essay question**: Give a concise, direct answer covering all required points.
+- **General knowledge / factual**: Answer directly, no fluff.
+
+If there are multiple questions visible, answer each one. No preamble, no meta-commentary — just the answers.`;
+
+async function sendImageToGeminiHttp(base64Data, prompt) {
+    const effectivePrompt = prompt || DEFAULT_SCREEN_PROMPT;
+    try {
+        console.log(`Sending image to ${OPENAI_MODEL} (streaming)...`);
+
+        const stream = await openai.chat.completions.create({
+            model: OPENAI_MODEL,
+            messages: [
+                {
+                    role: 'user',
+                    content: [
+                        {
+                            type: 'image_url',
+                            image_url: { url: `data:image/jpeg;base64,${base64Data}` }
+                        },
+                        { type: 'text', text: effectivePrompt }
+                    ]
+                }
+            ],
+            stream: true
+        });
+
+        let fullText = '';
+        let isFirst = true;
+
+        for await (const chunk of stream) {
+            const chunkText = chunk.choices[0]?.delta?.content || '';
+            if (chunkText) {
+                fullText += chunkText;
+                sendToRenderer(isFirst ? 'new-response' : 'update-response', fullText);
+                isFirst = false;
+            }
+        }
+
+        console.log(`Image response completed from ${OPENAI_MODEL}`);
+        saveScreenAnalysis(effectivePrompt, fullText, OPENAI_MODEL);
+        return { success: true, text: fullText, model: OPENAI_MODEL };
+    } catch (error) {
+        console.error('Error sending image to OpenAI:', error);
         return { success: false, error: error.message };
     }
 }
@@ -748,7 +584,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
     global.geminiSessionRef = geminiSessionRef;
 
     ipcMain.handle('initialize-gemini', async (event, apiKey, customPrompt, profile = 'interview', language = 'en-US') => {
-        // apiKey parameter kept for compatibility but not required for Ollama
+        // apiKey parameter kept for IPC compatibility
         const session = await initializeGeminiSession(apiKey, customPrompt, profile, language);
         if (session) {
             // Store session info
@@ -760,11 +596,13 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
 
     ipcMain.handle('send-audio-content', async (event, { data, mimeType }) => {
         if (!geminiSessionRef.current) return { success: false, error: 'No active Gemini session' };
-        
-        // Convert base64 audio to buffer and send to transcription
+
         try {
             const audioBuffer = Buffer.from(data, 'base64');
-            processAudioChunk(audioBuffer, 'system');
+            if (isPTTRecording) {
+                pttAudioChunks.push(audioBuffer);
+                feedPTTRealtimeAudio(audioBuffer);
+            }
             return { success: true };
         } catch (error) {
             console.error('Error processing system audio:', error);
@@ -772,27 +610,17 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         }
     });
 
-    // Handle microphone audio on a separate channel
-    ipcMain.handle('send-mic-audio-content', async (event, { data, mimeType }) => {
-        if (!geminiSessionRef.current) return { success: false, error: 'No active Gemini session' };
-        
-        // Ensure mic transcription is started
-        if (!getMicAudioTranscription()) {
-            startMicAudioTranscription();
-        }
-        
-        // Convert base64 audio to buffer and send to transcription
-        try {
-            const audioBuffer = Buffer.from(data, 'base64');
-            processAudioChunk(audioBuffer, 'mic');
-            return { success: true };
-        } catch (error) {
-            console.error('Error processing mic audio:', error);
-            return { success: false, error: error.message };
-        }
+    // Microphone path disabled — PTT uses system audio only
+    ipcMain.handle('send-mic-audio-content', async () => {
+        return { success: true };
     });
 
     ipcMain.handle('send-image-content', async (event, { data, prompt }) => {
+        if (sendImageContentLocked) {
+            console.warn('send-image-content: request ignored while another vision request is running');
+            return { success: false, error: 'Screen analysis already in progress' };
+        }
+        sendImageContentLocked = true;
         try {
             if (!data || typeof data !== 'string') {
                 console.error('Invalid image data received');
@@ -806,14 +634,12 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
                 return { success: false, error: 'Image buffer too small' };
             }
 
-            process.stdout.write('!');
-
-            // Use HTTP API instead of realtime session
-            const result = await sendImageToGeminiHttp(data, prompt);
-            return result;
+            return await sendImageToGeminiHttp(data, prompt);
         } catch (error) {
             console.error('Error sending image:', error);
             return { success: false, error: error.message };
+        } finally {
+            sendImageContentLocked = false;
         }
     });
 
@@ -861,16 +687,103 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         }
     });
 
+    ipcMain.handle('ptt-start', async event => {
+        return runPttSequential(async () => {
+            try {
+                if (!geminiSessionRef.current) {
+                    return { success: false, error: 'No active Gemini session' };
+                }
+                startPTTRealtimeSession();
+                isPTTRecording = true;
+                pttAudioChunks = [];
+                sendToRenderer('ptt-status', { status: 'Recording…' });
+                return { success: true };
+            } catch (error) {
+                console.error('Error on PTT start:', error);
+                stopPTTRealtimeSession();
+                isPTTRecording = false;
+                return { success: false, error: error.message };
+            }
+        });
+    });
+
+    ipcMain.handle('ptt-release', async event => {
+        return runPttSequential(async () => {
+            let tempPath = null;
+            try {
+                if (!geminiSessionRef.current) {
+                    isPTTRecording = false;
+                    pttAudioChunks = [];
+                    sendToRenderer('ptt-live-transcript-clear');
+                    stopPTTRealtimeSession();
+                    return { success: false, error: 'No active Gemini session' };
+                }
+
+                isPTTRecording = false;
+                const chunks = [...pttAudioChunks];
+                pttAudioChunks = [];
+
+                sendToRenderer('ptt-live-transcript-clear');
+                stopPTTRealtimeSession();
+
+                sendToRenderer('ptt-status', { status: 'Transcribing…' });
+
+                if (chunks.length === 0) {
+                    sendToRenderer('ptt-complete', { success: true, skipped: true });
+                    sendToRenderer('ptt-status', { status: 'idle' });
+                    sendToRenderer('update-status', 'Session ready - OpenAI');
+                    return { success: true };
+                }
+
+                const pcm = Buffer.concat(chunks);
+                const wav = pcmToWavBuffer(pcm, 24000, 1, 16);
+                tempPath = path.join(os.tmpdir(), `ptt-${Date.now()}.wav`);
+                fs.writeFileSync(tempPath, wav);
+
+                const tx = await openai.audio.transcriptions.create({
+                    file: fs.createReadStream(tempPath),
+                    model: 'whisper-1',
+                });
+
+                const text = (tx.text || '').trim();
+                if (text) {
+                    await sendTextToGemini(text);
+                }
+
+                sendToRenderer('ptt-complete', { success: true });
+                sendToRenderer('ptt-status', { status: 'idle' });
+                sendToRenderer('update-status', 'Session ready - OpenAI');
+                return { success: true };
+            } catch (error) {
+                console.error('Error on PTT release:', error);
+                sendToRenderer('ptt-complete', { success: false, error: error.message });
+                sendToRenderer('ptt-status', { status: 'idle' });
+                sendToRenderer('update-status', 'Session ready - OpenAI');
+                return { success: false, error: error.message };
+            } finally {
+                if (tempPath) {
+                    try {
+                        if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+                    } catch (_) {
+                        /* ignore */
+                    }
+                }
+            }
+        });
+    });
+
     ipcMain.handle('close-session', async event => {
         try {
             stopMacOSAudioCapture();
-            stopAllTranscription();
+            isPTTRecording = false;
+            pttAudioChunks = [];
+            stopPTTRealtimeSession();
 
             // Set flag to prevent reconnection attempts
             isUserClosing = true;
             sessionParams = null;
 
-            // Cleanup session (Ollama mode, just clear references)
+            // Cleanup session
             if (geminiSessionRef.current) {
                 geminiSessionRef.current = null;
                 conversationContext = [];

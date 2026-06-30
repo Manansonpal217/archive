@@ -1,10 +1,13 @@
 const WebSocket = require('ws');
 const { BrowserWindow } = require('electron');
-const { getAssemblyApiKey } = require('../storage');
+
+const ASSEMBLYAI_API_KEY = '30cd51828bf64f259a369c344c750ce0';
 
 // Transcription session management
 let systemAudioTranscription = null;
 let micAudioTranscription = null;
+/** Single-session realtime ASR used only while PTT button is held (system audio). */
+let pttRealtimeSession = null;
 let transcriptionCallbacks = [];
 
 // Export state getters
@@ -23,265 +26,249 @@ function sendToRenderer(channel, data) {
     }
 }
 
+const SILENCE_RMS_THRESHOLD = 150;   // RMS below this = silence (16-bit PCM scale)
+const SILENCE_CHUNKS_TO_SEGMENT = 5; // ~500ms silence → finalize current partial into segment buffer
+
+// Calculate RMS energy of a 16-bit PCM buffer
+function calculateRMS(buffer) {
+    if (buffer.length < 2) return 0;
+    const samples = Math.floor(buffer.length / 2);
+    let sum = 0;
+    for (let i = 0; i < samples; i++) {
+        const s = buffer.readInt16LE(i * 2);
+        sum += s * s;
+    }
+    return Math.sqrt(sum / samples);
+}
+
 // Create a WebSocket connection to AssemblyAI for real-time transcription
 function createTranscriptionStream(audioSource = 'system') {
-    // Ensure storage is initialized
-    const storage = require('../storage');
-    storage.initializeStorage();
-    
-    const apiKey = getAssemblyApiKey();
-    if (!apiKey) {
-        console.error('AssemblyAI API key not configured. Please set it via storage:set-assembly-api-key');
-        console.error('Current credentials:', JSON.stringify(storage.getCredentials()));
-        return null;
-    }
-    
-    console.log(`Starting AssemblyAI transcription for ${audioSource} audio (key: ${apiKey.substring(0, 8)}...)`);
+    console.log(`Starting AssemblyAI transcription for ${audioSource} audio (key: ${ASSEMBLYAI_API_KEY.substring(0, 8)}...)`);
 
-    // AssemblyAI Universal Streaming endpoint (v3)
-    const wsUrl = 'wss://streaming.assemblyai.com/v3/ws?sample_rate=16000';
-    
+    const wsUrl = 'wss://streaming.assemblyai.com/v3/ws?sample_rate=16000&speech_model=universal-streaming-english';
+
     const ws = new WebSocket(wsUrl, {
-        headers: {
-            Authorization: apiKey
-        }
+        headers: { Authorization: ASSEMBLYAI_API_KEY }
     });
 
     let sessionId = null;
-    let isFinal = false;
-    let currentTranscript = '';
-    let audioQueue = []; // Queue audio chunks during connection
+    let audioQueue = [];
     let isConnected = false;
-    let lastPartialTranscript = '';
-    let partialTranscriptTimeout = null;
+    let consecutiveSilentChunks = 0;
+
+    // Two-stage buffer:
+    //  segmentBuffer  — completed partial segments from this speaker turn (not yet sent to AI)
+    //  currentPartial — the partial currently being built by AssemblyAI
+    let segmentBuffer = [];
+    let currentPartial = '';
+    let lastSentToAI = '';        // dedup: don't send the same text twice
+
+    function getAccumulated() {
+        const parts = [...segmentBuffer];
+        if (currentPartial) parts.push(currentPartial);
+        return parts.join(' ').trim();
+    }
+
+    // Add currentPartial to segmentBuffer and reset it
+    function commitCurrentPartial() {
+        if (!currentPartial.trim()) return;
+        const last = segmentBuffer[segmentBuffer.length - 1];
+        if (last !== currentPartial) segmentBuffer.push(currentPartial);
+        currentPartial = '';
+    }
+
+    // Send the accumulated buffer to AI (called manually via PTT release)
+    function dispatchToAI(reason) {
+        commitCurrentPartial();
+        const text = segmentBuffer.join(' ').trim();
+        if (!text || text === lastSentToAI) return;
+        lastSentToAI = text;
+        segmentBuffer = [];
+        console.log(`✅ [${audioSource.toUpperCase()}] ${reason} → AI: "${text}"`);
+        sendToRenderer('transcription-final', { source: audioSource, text, timestamp: Date.now() });
+        sendToRenderer('transcription-ready', { source: audioSource, text });
+    }
+
+    // Reset all buffers so PTT starts fresh each press
+    function resetBuffers() {
+        segmentBuffer = [];
+        currentPartial = '';
+        lastSentToAI = '';
+        console.log(`🔄 [${audioSource.toUpperCase()}] Buffers reset for PTT`);
+    }
 
     ws.on('open', () => {
         console.log(`AssemblyAI ${audioSource} transcription stream connected`);
         isConnected = true;
-        
-        // Send any queued audio chunks
+
         if (audioQueue.length > 0) {
             console.log(`Sending ${audioQueue.length} queued audio chunks for ${audioSource}`);
             audioQueue.forEach(chunk => {
-                if (ws.readyState === WebSocket.OPEN) {
-                    ws.send(chunk, { binary: true });
-                }
+                if (ws.readyState === WebSocket.OPEN) ws.send(chunk, { binary: true });
             });
             audioQueue = [];
         }
-        
-        sendToRenderer('transcription-status', {
-            source: audioSource,
-            status: 'connected',
-            message: `Transcription active for ${audioSource} audio`
-        });
+
+        if (audioSource !== 'ptt') {
+            sendToRenderer('transcription-status', {
+                source: audioSource,
+                status: 'connected',
+                message: `Transcription active for ${audioSource} audio`
+            });
+        }
     });
 
     ws.on('message', (data) => {
         try {
             const message = JSON.parse(data.toString());
             const msgType = message.type || message.message_type;
-            
+
             if (msgType === 'SessionBegins' || msgType === 'SessionCreated' || msgType === 'Begin') {
                 sessionId = message.session_id || message.id;
                 console.log(`AssemblyAI session started: ${sessionId} (${audioSource})`);
-                isConnected = true; // Mark as connected when Begin message received
-            } else if (msgType === 'Turn') {
-                // Turn message - Universal Streaming API uses this for both partial and final
-                const transcript = message.transcript || message.text || '';
-                const isFormatted = message.turn_is_formatted === true;
-                
-                if (transcript && transcript.trim()) {
-                    if (isFormatted) {
-                        // Final transcript (complete and formatted)
-                        currentTranscript = transcript;
-                        isFinal = true;
-                        
-                        console.log(`✅ [${audioSource.toUpperCase()}] Final Turn: "${transcript}"`);
-                        
-                        sendToRenderer('transcription-final', {
-                            source: audioSource,
-                            text: transcript,
-                            timestamp: message.audio_start || message.created || Date.now()
-                        });
+                isConnected = true;
 
-                        // Send to text message handler for AI processing
-                        sendToRenderer('transcription-ready', {
-                            source: audioSource,
-                            text: transcript
-                        });
-                    } else {
-                        // Partial transcript (still being processed)
-                        console.log(`🔄 [${audioSource}] Partial Turn: "${transcript}"`);
-                        lastPartialTranscript = transcript;
-                        
-                        // Clear existing timeout
-                        if (partialTranscriptTimeout) {
-                            clearTimeout(partialTranscriptTimeout);
-                        }
-                        
-                        // Send partial to UI
-                        sendToRenderer('transcription-partial', {
-                            source: audioSource,
-                            text: transcript,
-                            timestamp: message.audio_start || message.created || Date.now()
-                        });
-                        
-                        // If transcript hasn't changed for 2 seconds, treat it as final and send to Ollama
-                        // This handles cases where turn_is_formatted never becomes true
-                        partialTranscriptTimeout = setTimeout(() => {
-                            if (lastPartialTranscript === transcript && transcript.trim()) {
-                                console.log(`⏱️ [${audioSource}] Transcript stabilized, sending to Ollama: "${transcript}"`);
-                                
-                                // Send as final transcript
-                                sendToRenderer('transcription-final', {
-                                    source: audioSource,
-                                    text: transcript,
-                                    timestamp: Date.now()
-                                });
-                                
-                                // Send to Ollama
-                                sendToRenderer('transcription-ready', {
-                                    source: audioSource,
-                                    text: transcript
-                                });
-                                
-                                lastPartialTranscript = ''; // Clear to avoid duplicates
-                            }
-                        }, 2000); // 2 second delay
-                    }
-                }
-            } else if (msgType === 'PartialTranscript' || msgType === 'Partial') {
-                // Partial transcript (still being processed)
-                const transcript = message.transcript || message.text || '';
-                if (transcript && transcript.trim()) {
-                    console.log(`🔄 [${audioSource}] Partial: "${transcript}"`);
+            } else if (msgType === 'Turn') {
+                const transcript = (message.transcript || message.text || '').trim();
+                const isFormatted = message.turn_is_formatted === true;
+
+                if (!transcript) return;
+
+                consecutiveSilentChunks = 0; // speaker is talking
+                currentPartial = transcript;
+
+                // Show the full accumulated picture in the UI
+                if (audioSource === 'ptt') {
+                    sendToRenderer('ptt-live-transcript', { text: getAccumulated() });
+                } else {
                     sendToRenderer('transcription-partial', {
                         source: audioSource,
-                        text: transcript,
+                        text: getAccumulated(),
                         timestamp: message.audio_start || message.created || Date.now()
                     });
                 }
-            } else if (msgType === 'FinalTranscript' || msgType === 'Final') {
-                // Final transcript (complete)
-                const transcript = message.transcript || message.text || '';
-                if (transcript && transcript.trim()) {
-                    currentTranscript = transcript;
-                    isFinal = true;
-                    
-                    console.log(`✅ [${audioSource.toUpperCase()}] Final: "${transcript}"`);
-                    
-                    sendToRenderer('transcription-final', {
-                        source: audioSource,
-                        text: transcript,
-                        timestamp: message.audio_start || message.created || Date.now()
-                    });
 
-                    // Send to text message handler for AI processing
-                    sendToRenderer('transcription-ready', {
+                if (isFormatted) {
+                    // AssemblyAI confirmed this sentence is complete — buffer it; PTT release will send to AI
+                    commitCurrentPartial();
+                    if (audioSource === 'ptt') {
+                        sendToRenderer('ptt-live-transcript', { text: getAccumulated() });
+                    }
+                } else {
+                    // Still a partial — just update currentPartial, no auto-flush
+                }
+
+            } else if (msgType === 'PartialTranscript' || msgType === 'Partial') {
+                const transcript = (message.transcript || message.text || '').trim();
+                if (!transcript) return;
+
+                consecutiveSilentChunks = 0;
+                currentPartial = transcript;
+
+                if (audioSource === 'ptt') {
+                    sendToRenderer('ptt-live-transcript', { text: getAccumulated() });
+                } else {
+                    sendToRenderer('transcription-partial', {
                         source: audioSource,
-                        text: transcript
+                        text: getAccumulated(),
+                        timestamp: message.audio_start || message.created || Date.now()
                     });
                 }
+
+            } else if (msgType === 'FinalTranscript' || msgType === 'Final') {
+                const transcript = (message.transcript || message.text || '').trim();
+                if (!transcript) return;
+                currentPartial = transcript;
+                commitCurrentPartial();
+                if (audioSource === 'ptt') {
+                    sendToRenderer('ptt-live-transcript', { text: getAccumulated() });
+                }
+
             } else if (msgType === 'SessionTerminated' || msgType === 'Termination') {
                 console.log(`AssemblyAI session terminated: ${sessionId} (${audioSource})`);
-                sendToRenderer('transcription-status', {
-                    source: audioSource,
-                    status: 'disconnected',
-                    message: `Transcription stopped for ${audioSource} audio`
-                });
-            } else {
-                // Log ALL messages for debugging - this will help us see what AssemblyAI is sending
+                if (audioSource !== 'ptt') {
+                    sendToRenderer('transcription-status', {
+                        source: audioSource,
+                        status: 'disconnected',
+                        message: `Transcription stopped for ${audioSource} audio`
+                    });
+                }
+
+            } else if (msgType !== 'Error') {
                 console.log(`📨 AssemblyAI message (${audioSource}):`, JSON.stringify(message, null, 2));
             }
         } catch (error) {
             console.error(`Error parsing AssemblyAI message (${audioSource}):`, error);
-            console.error('Raw message:', data.toString());
         }
     });
 
     ws.on('error', (error) => {
         console.error(`AssemblyAI WebSocket error (${audioSource}):`, error);
-        audioQueue = []; // Clear queue on error
-        sendToRenderer('transcription-status', {
-            source: audioSource,
-            status: 'error',
-            message: `Transcription error: ${error.message}`
-        });
+        audioQueue = [];
+        if (audioSource !== 'ptt') {
+            sendToRenderer('transcription-status', {
+                source: audioSource,
+                status: 'error',
+                message: `Transcription error: ${error.message}`
+            });
+        }
     });
 
     ws.on('close', (code, reason) => {
         console.log(`AssemblyAI WebSocket closed (${audioSource}):`, code, reason?.toString());
-        sendToRenderer('transcription-status', {
-            source: audioSource,
-            status: 'disconnected',
-            message: `Transcription connection closed for ${audioSource} audio`
-        });
+        if (audioSource !== 'ptt') {
+            sendToRenderer('transcription-status', {
+                source: audioSource,
+                status: 'disconnected',
+                message: `Transcription connection closed for ${audioSource} audio`
+            });
+        }
     });
 
     return {
         ws,
         sendAudio: (audioBuffer) => {
+            if (audioBuffer.length === 0) return;
+
             if (ws.readyState === WebSocket.OPEN && isConnected) {
-                // Universal Streaming API expects raw PCM audio as binary frames
-                // Audio should be 16-bit PCM, mono, 16kHz
-                // Verify buffer is not empty and has correct size
-                if (audioBuffer.length === 0) {
-                    console.warn(`⚠️ Empty audio buffer for ${audioSource}`);
-                    return;
+                const rms = calculateRMS(audioBuffer);
+
+                if (rms < SILENCE_RMS_THRESHOLD) {
+                    consecutiveSilentChunks++;
+                    // Commit any in-progress partial on silence so it's ready for PTT release
+                    if (consecutiveSilentChunks === SILENCE_CHUNKS_TO_SEGMENT && currentPartial) {
+                        console.log(`🔇 [${audioSource}] Silence detected, committing partial: "${currentPartial}"`);
+                        commitCurrentPartial();
+                        if (audioSource === 'ptt') {
+                            sendToRenderer('ptt-live-transcript', { text: getAccumulated() });
+                        }
+                    }
+                } else {
+                    consecutiveSilentChunks = 0;
                 }
-                
-                // Log first few sends to verify audio is being sent
-                if (Math.random() < 0.01) { // Log ~1% of sends to avoid spam
-                    console.log(`📤 Sending audio chunk (${audioSource}): ${audioBuffer.length} bytes`);
+
+                if (Math.random() < 0.005) {
+                    console.log(`📤 Audio chunk (${audioSource}): ${audioBuffer.length}B RMS:${Math.round(rms)}`);
                 }
-                
+
                 ws.send(audioBuffer, { binary: true });
             } else if (ws.readyState === WebSocket.CONNECTING || !isConnected) {
-                // Queue audio if still connecting - will send once connected
                 audioQueue.push(audioBuffer);
-                // Limit queue size to prevent memory issues (keep last 50 chunks ~5 seconds at 100ms chunks)
-                if (audioQueue.length > 50) {
-                    audioQueue.shift(); // Remove oldest chunk
-                }
+                if (audioQueue.length > 50) audioQueue.shift();
             }
         },
-        getStats: () => {
-            return {
-                connected: isConnected,
-                readyState: ws.readyState,
-                queueLength: audioQueue.length,
-                sessionId: sessionId
-            };
-        },
+        manualFlush: () => dispatchToAI('PTT release'),
+        resetBuffers,
+        getAccumulatedText: () => getAccumulated(),
+        getStats: () => ({
+            connected: isConnected,
+            readyState: ws.readyState,
+            queueLength: audioQueue.length,
+            sessionId
+        }),
         close: () => {
-            // Clear any pending timeouts
-            if (partialTranscriptTimeout) {
-                clearTimeout(partialTranscriptTimeout);
-                partialTranscriptTimeout = null;
-            }
-            
-            // Send any pending partial transcript as final before closing
-            if (lastPartialTranscript && lastPartialTranscript.trim()) {
-                console.log(`📤 [${audioSource}] Sending final transcript before close: "${lastPartialTranscript}"`);
-                sendToRenderer('transcription-final', {
-                    source: audioSource,
-                    text: lastPartialTranscript,
-                    timestamp: Date.now()
-                });
-                sendToRenderer('transcription-ready', {
-                    source: audioSource,
-                    text: lastPartialTranscript
-                });
-            }
-            
             if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-                // Send termination message (Universal Streaming API format)
-                try {
-                    ws.send(JSON.stringify({ type: 'CloseStream' }));
-                } catch (e) {
-                    // Ignore errors when closing
-                }
+                try { ws.send(JSON.stringify({ type: 'CloseStream' })); } catch (e) {}
                 ws.close();
             }
         }
@@ -332,6 +319,20 @@ function stopAllTranscription() {
     stopMicAudioTranscription();
 }
 
+// Flush mic transcription to AI (called on PTT button release)
+function flushMicTranscription() {
+    if (micAudioTranscription) {
+        micAudioTranscription.manualFlush();
+    }
+}
+
+// Reset mic transcription buffers (called on PTT button press for a fresh recording)
+function resetMicTranscriptionBuffers() {
+    if (micAudioTranscription) {
+        micAudioTranscription.resetBuffers();
+    }
+}
+
 // Process audio chunk and send to transcription
 function processAudioChunk(audioBuffer, source = 'system') {
     // Resample from 24kHz to 16kHz if needed (AssemblyAI expects 16kHz)
@@ -373,6 +374,36 @@ function resampleAudio(inputBuffer, inputSampleRate, outputSampleRate) {
     return outputBuffer;
 }
 
+/** Fresh AssemblyAI stream for one PTT press (live captions only). */
+function startPTTRealtimeSession() {
+    if (pttRealtimeSession) {
+        try {
+            pttRealtimeSession.close();
+        } catch (_) {
+            /* ignore */
+        }
+        pttRealtimeSession = null;
+    }
+    pttRealtimeSession = createTranscriptionStream('ptt');
+}
+
+function feedPTTRealtimeAudio(audioBuffer24kMono) {
+    if (!pttRealtimeSession || audioBuffer24kMono.length === 0) return;
+    const resampledBuffer = resampleAudio(audioBuffer24kMono, 24000, 16000);
+    pttRealtimeSession.sendAudio(resampledBuffer);
+}
+
+function stopPTTRealtimeSession() {
+    if (!pttRealtimeSession) return;
+    try {
+        pttRealtimeSession.close();
+    } catch (_) {
+        /* ignore */
+    } finally {
+        pttRealtimeSession = null;
+    }
+}
+
 module.exports = {
     startSystemAudioTranscription,
     startMicAudioTranscription,
@@ -380,7 +411,12 @@ module.exports = {
     stopMicAudioTranscription,
     stopAllTranscription,
     processAudioChunk,
+    flushMicTranscription,
+    resetMicTranscriptionBuffers,
     sendToRenderer,
     getSystemAudioTranscription,
-    getMicAudioTranscription
+    getMicAudioTranscription,
+    startPTTRealtimeSession,
+    feedPTTRealtimeAudio,
+    stopPTTRealtimeSession
 };

@@ -16,6 +16,30 @@ let offscreenCanvas = null;
 let offscreenContext = null;
 let currentImageQuality = 'medium'; // Store current image quality for manual screenshots
 
+/** Prevents stacking parallel vision requests when the next-step shortcut repeats (key repeat / accidental double-trigger). */
+let manualScreenshotInFlight = false;
+
+/** Long edge cap keeps JPEG payloads small so uploads fit slow networks and TLS connect stalls less often. */
+const MAX_CAPTURE_LONG_EDGE = 1600;
+
+function getScaledScreenshotDimensions(videoWidth, videoHeight, maxEdge) {
+    const vw = Number(videoWidth) || 640;
+    const vh = Number(videoHeight) || 480;
+    if (vw <= maxEdge && vh <= maxEdge) {
+        return { width: vw, height: vh };
+    }
+    if (vw >= vh) {
+        return {
+            width: maxEdge,
+            height: Math.max(1, Math.round((vh * maxEdge) / vw)),
+        };
+    }
+    return {
+        width: Math.max(1, Math.round((vw * maxEdge) / vh)),
+        height: maxEdge,
+    };
+}
+
 const isLinux = process.platform === 'linux';
 const isMacOS = process.platform === 'darwin';
 
@@ -163,10 +187,16 @@ async function startCapture(screenshotIntervalSeconds = 5, imageQuality = 'mediu
             // On macOS, use SystemAudioDump for audio and getDisplayMedia for screen
             console.log('Starting macOS capture with SystemAudioDump...');
 
-            // Start macOS audio capture
-            const audioResult = await ipcRenderer.invoke('start-macos-audio');
-            if (!audioResult.success) {
-                throw new Error('Failed to start macOS audio capture: ' + audioResult.error);
+            // Start macOS audio capture — non-fatal: audio failure should not block screen capture
+            try {
+                const audioResult = await ipcRenderer.invoke('start-macos-audio');
+                if (!audioResult.success) {
+                    console.warn('macOS audio capture failed (PTT will be unavailable):', audioResult.error);
+                } else {
+                    console.log('macOS audio capture started');
+                }
+            } catch (audioErr) {
+                console.warn('macOS audio capture threw an error (PTT will be unavailable):', audioErr);
             }
 
             // Get screen capture for screenshots
@@ -517,92 +547,127 @@ If its a question about the website, give me the answer no bs, complete answer.
 If its a mcq question, give me the answer no bs, complete answer.`;
 
 async function captureManualScreenshot(imageQuality = null) {
+    if (manualScreenshotInFlight) {
+        console.warn('Screen analysis already running; skipping duplicate trigger');
+        cheatingDaddy.addNewResponse('*A screen analysis is already running — please wait for it to finish.*');
+        return;
+    }
+
     console.log('Manual screenshot triggered');
     const quality = imageQuality || currentImageQuality;
 
     if (!mediaStream) {
-        console.error('No media stream available');
+        console.error('No media stream available — screen capture may not have started yet');
+        cheatingDaddy.addNewResponse('⚠️ Screen capture is not active. Please start a session first and grant screen sharing permission when prompted.');
         return;
     }
 
-    // Lazy init of video element
-    if (!hiddenVideo) {
-        hiddenVideo = document.createElement('video');
-        hiddenVideo.srcObject = mediaStream;
-        hiddenVideo.muted = true;
-        hiddenVideo.playsInline = true;
-        await hiddenVideo.play();
+    manualScreenshotInFlight = true;
 
-        await new Promise(resolve => {
-            if (hiddenVideo.readyState >= 2) return resolve();
-            hiddenVideo.onloadedmetadata = () => resolve();
-        });
+    try {
+        // Lazy init of video element
+        if (!hiddenVideo) {
+            hiddenVideo = document.createElement('video');
+            hiddenVideo.srcObject = mediaStream;
+            hiddenVideo.muted = true;
+            hiddenVideo.playsInline = true;
+            await hiddenVideo.play();
 
-        // Lazy init of canvas based on video dimensions
-        offscreenCanvas = document.createElement('canvas');
-        offscreenCanvas.width = hiddenVideo.videoWidth;
-        offscreenCanvas.height = hiddenVideo.videoHeight;
-        offscreenContext = offscreenCanvas.getContext('2d');
+            await new Promise(resolve => {
+                if (hiddenVideo.readyState >= 2) return resolve();
+                hiddenVideo.onloadedmetadata = () => resolve();
+            });
+
+            offscreenCanvas = document.createElement('canvas');
+            offscreenContext = offscreenCanvas.getContext('2d');
+        }
+
+        if (hiddenVideo.readyState < 2) {
+            console.warn('Video not ready yet, skipping screenshot');
+            manualScreenshotInFlight = false;
+            return;
+        }
+
+        const vw = hiddenVideo.videoWidth;
+        const vh = hiddenVideo.videoHeight;
+        const { width: cw, height: ch } = getScaledScreenshotDimensions(vw, vh, MAX_CAPTURE_LONG_EDGE);
+
+        if (!offscreenCanvas || !offscreenContext) {
+            offscreenCanvas = document.createElement('canvas');
+            offscreenContext = offscreenCanvas.getContext('2d');
+        }
+        offscreenCanvas.width = cw;
+        offscreenCanvas.height = ch;
+        offscreenContext.drawImage(hiddenVideo, 0, 0, vw, vh, 0, 0, cw, ch);
+
+        let qualityValue;
+        switch (quality) {
+            case 'high':
+                qualityValue = 0.9;
+                break;
+            case 'medium':
+                qualityValue = 0.7;
+                break;
+            case 'low':
+                qualityValue = 0.5;
+                break;
+            default:
+                qualityValue = 0.7;
+        }
+
+        offscreenCanvas.toBlob(
+            blob => {
+                (async () => {
+                    try {
+                        if (!blob) {
+                            console.error('Failed to create blob from canvas');
+                            return;
+                        }
+
+                        const base64data = await new Promise((resolve, reject) => {
+                            const reader = new FileReader();
+                            reader.onloadend = () => {
+                                const data = typeof reader.result === 'string'
+                                    ? reader.result.split(',')[1]
+                                    : null;
+                                resolve(data);
+                            };
+                            reader.onerror = () => reject(reader.error || new Error('FileReader failed'));
+                            reader.readAsDataURL(blob);
+                        });
+
+                        if (!base64data || base64data.length < 100) {
+                            console.error('Invalid base64 data generated');
+                            return;
+                        }
+
+                        const result = await ipcRenderer.invoke('send-image-content', {
+                            data: base64data,
+                            prompt: MANUAL_SCREENSHOT_PROMPT,
+                        });
+
+                        if (result.success) {
+                            console.log(`Image response completed from ${result.model}`);
+                        } else {
+                            console.error('Failed to get image response:', result.error);
+                            cheatingDaddy.addNewResponse(`Error: ${result.error}`);
+                        }
+                    } catch (err) {
+                        console.error('Manual screenshot pipeline error:', err);
+                        cheatingDaddy.addNewResponse(`Error: ${err.message || String(err)}`);
+                    } finally {
+                        manualScreenshotInFlight = false;
+                    }
+                })();
+            },
+            'image/jpeg',
+            qualityValue
+        );
+    } catch (err) {
+        manualScreenshotInFlight = false;
+        console.error('Error preparing manual screenshot:', err);
+        cheatingDaddy.addNewResponse(`Error: ${err.message || String(err)}`);
     }
-
-    // Check if video is ready
-    if (hiddenVideo.readyState < 2) {
-        console.warn('Video not ready yet, skipping screenshot');
-        return;
-    }
-
-    offscreenContext.drawImage(hiddenVideo, 0, 0, offscreenCanvas.width, offscreenCanvas.height);
-
-    let qualityValue;
-    switch (quality) {
-        case 'high':
-            qualityValue = 0.9;
-            break;
-        case 'medium':
-            qualityValue = 0.7;
-            break;
-        case 'low':
-            qualityValue = 0.5;
-            break;
-        default:
-            qualityValue = 0.7;
-    }
-
-    offscreenCanvas.toBlob(
-        async blob => {
-            if (!blob) {
-                console.error('Failed to create blob from canvas');
-                return;
-            }
-
-            const reader = new FileReader();
-            reader.onloadend = async () => {
-                const base64data = reader.result.split(',')[1];
-
-                if (!base64data || base64data.length < 100) {
-                    console.error('Invalid base64 data generated');
-                    return;
-                }
-
-                // Send image with prompt to HTTP API (response streams via IPC events)
-                const result = await ipcRenderer.invoke('send-image-content', {
-                    data: base64data,
-                    prompt: MANUAL_SCREENSHOT_PROMPT,
-                });
-
-                if (result.success) {
-                    console.log(`Image response completed from ${result.model}`);
-                    // Response already displayed via streaming events (new-response/update-response)
-                } else {
-                    console.error('Failed to get image response:', result.error);
-                    cheatingDaddy.addNewResponse(`Error: ${result.error}`);
-                }
-            };
-            reader.readAsDataURL(blob);
-        },
-        'image/jpeg',
-        qualityValue
-    );
 }
 
 // Expose functions to global scope for external access
@@ -650,6 +715,30 @@ function stopCapture() {
     }
     offscreenCanvas = null;
     offscreenContext = null;
+}
+
+// Push-to-talk: begin buffering system audio in main process
+async function startPTT() {
+    try {
+        const result = await ipcRenderer.invoke('ptt-start');
+        console.log('PTT started — recording system audio');
+        return result;
+    } catch (error) {
+        console.error('Error starting PTT:', error);
+        return { success: false, error: error.message };
+    }
+}
+
+// Push-to-talk: transcribe buffered audio (Whisper) then send text to OpenAI
+async function stopPTT() {
+    try {
+        const result = await ipcRenderer.invoke('ptt-release');
+        console.log('PTT released — transcribe & AI complete');
+        return result;
+    } catch (error) {
+        console.error('Error stopping PTT:', error);
+        return { success: false, error: error.message };
+    }
 }
 
 // Send text message to Gemini
@@ -716,85 +805,13 @@ ipcRenderer.on('clear-sensitive-data', async () => {
     await storage.clearAll();
 });
 
-// Listen for transcription events from main process
-ipcRenderer.on('transcription-status', (event, data) => {
-    const sourceLabel = data.source === 'system' ? '🎤 System Audio' : '🎙️ Microphone';
-    console.log(`\n📡 ${sourceLabel} - ${data.status.toUpperCase()}: ${data.message}\n`);
-    
-    if (data.status === 'connected') {
-        cheatingDaddy.setStatus(`Transcription active: ${data.source === 'system' ? 'System' : 'Mic'}`);
-    } else if (data.status === 'error') {
-        cheatingDaddy.setStatus(`Transcription error: ${data.message}`);
-        console.error(`❌ Transcription error (${data.source}):`, data.message);
-    } else if (data.status === 'disconnected') {
-        console.warn(`⚠️ Transcription disconnected (${data.source})`);
-    }
+ipcRenderer.on('ptt-status', (event, { status }) => {
+    cheatingDaddy.setStatus(status === 'idle' ? 'Live' : status);
 });
 
-// Store partial transcripts for real-time display
-let currentPartialTranscripts = {
-    system: '',
-    mic: ''
-};
-
-// Track last final transcript to avoid duplicates
-let lastFinalTranscripts = {
-    system: '',
-    mic: ''
-};
-
-ipcRenderer.on('transcription-partial', (event, data) => {
-    // Update partial transcript for real-time display
-    currentPartialTranscripts[data.source] = data.text;
-    
-    // Show real-time transcription in console
-    const sourceLabel = data.source === 'system' ? '🎤 Interviewer' : '🎙️ You';
-    const partialText = `${sourceLabel} (typing...): ${data.text}`;
-    console.log(`\r${partialText}`, { clearLine: true });
-    
-    // Update UI with partial transcript (will be replaced when final comes in)
-    const displayText = `${sourceLabel}: ${data.text}`;
-    // Use updateCurrentResponse to show live typing effect
-    cheatingDaddy.updateCurrentResponse(displayText);
-});
-
-ipcRenderer.on('transcription-final', (event, data) => {
-    // Clear partial transcript for this source
-    currentPartialTranscripts[data.source] = '';
-    
-    const sourceLabel = data.source === 'system' ? '🎤 Interviewer' : '🎙️ You';
-    const finalText = `${sourceLabel}: ${data.text}`;
-    
-    // Only add if it's different from the last final transcript (avoid duplicates)
-    if (lastFinalTranscripts[data.source] !== data.text) {
-        lastFinalTranscripts[data.source] = data.text;
-        
-        console.log(`\n✅ ${finalText}\n`);
-        
-        // Display final transcription in UI as a new response
-        cheatingDaddy.addNewResponse(finalText);
-    }
-});
-
-ipcRenderer.on('transcription-ready', async (event, data) => {
-    // Automatically send transcribed text to AI for processing
-    if (data.text && data.text.trim()) {
-        const sourceLabel = data.source === 'system' ? '🎤 Interviewer' : '🎙️ You';
-        const formattedText = `${sourceLabel}: ${data.text}`;
-        
-        console.log(`\n🤖 Sending to Ollama: ${formattedText}\n`);
-        
-        // Send to AI for response
-        try {
-            const result = await sendTextMessage(formattedText);
-            if (result.success) {
-                console.log(`✅ Ollama response received`);
-            } else {
-                console.error(`❌ Ollama error: ${result.error}`);
-            }
-        } catch (error) {
-            console.error('❌ Error sending transcription to AI:', error);
-        }
+ipcRenderer.on('ptt-complete', (event, data) => {
+    if (!data?.success && data?.error) {
+        console.error('PTT pipeline error:', data.error);
     }
 });
 
@@ -1025,6 +1042,8 @@ const cheatingDaddy = {
     startCapture,
     stopCapture,
     sendTextMessage,
+    startPTT,
+    stopPTT,
     handleShortcut,
 
     // Storage API

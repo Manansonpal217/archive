@@ -1,40 +1,37 @@
 const fs = require('fs');
 const path = require('path');
 
-// Convert raw PCM to WAV format for easier playback and verification
-function pcmToWav(pcmBuffer, outputPath, sampleRate = 24000, channels = 1, bitDepth = 16) {
+/** Build WAV file bytes from raw PCM (no disk write). */
+function pcmToWavBuffer(pcmBuffer, sampleRate = 24000, channels = 1, bitDepth = 16) {
     const byteRate = sampleRate * channels * (bitDepth / 8);
     const blockAlign = channels * (bitDepth / 8);
     const dataSize = pcmBuffer.length;
 
-    // Create WAV header
     const header = Buffer.alloc(44);
 
-    // "RIFF" chunk descriptor
     header.write('RIFF', 0);
-    header.writeUInt32LE(dataSize + 36, 4); // File size - 8
+    header.writeUInt32LE(dataSize + 36, 4);
     header.write('WAVE', 8);
 
-    // "fmt " sub-chunk
     header.write('fmt ', 12);
-    header.writeUInt32LE(16, 16); // Subchunk1Size (16 for PCM)
-    header.writeUInt16LE(1, 20); // AudioFormat (1 for PCM)
-    header.writeUInt16LE(channels, 22); // NumChannels
-    header.writeUInt32LE(sampleRate, 24); // SampleRate
-    header.writeUInt32LE(byteRate, 28); // ByteRate
-    header.writeUInt16LE(blockAlign, 32); // BlockAlign
-    header.writeUInt16LE(bitDepth, 34); // BitsPerSample
+    header.writeUInt32LE(16, 16);
+    header.writeUInt16LE(1, 20);
+    header.writeUInt16LE(channels, 22);
+    header.writeUInt32LE(sampleRate, 24);
+    header.writeUInt32LE(byteRate, 28);
+    header.writeUInt16LE(blockAlign, 32);
+    header.writeUInt16LE(bitDepth, 34);
 
-    // "data" sub-chunk
     header.write('data', 36);
-    header.writeUInt32LE(dataSize, 40); // Subchunk2Size
+    header.writeUInt32LE(dataSize, 40);
 
-    // Combine header and PCM data
-    const wavBuffer = Buffer.concat([header, pcmBuffer]);
+    return Buffer.concat([header, pcmBuffer]);
+}
 
-    // Write to file
+// Convert raw PCM to WAV format for easier playback and verification
+function pcmToWav(pcmBuffer, outputPath, sampleRate = 24000, channels = 1, bitDepth = 16) {
+    const wavBuffer = pcmToWavBuffer(pcmBuffer, sampleRate, channels, bitDepth);
     fs.writeFileSync(outputPath, wavBuffer);
-
     return outputPath;
 }
 
@@ -130,6 +127,7 @@ function saveDebugAudio(buffer, type, timestamp = Date.now()) {
 
 module.exports = {
     pcmToWav,
+    pcmToWavBuffer,
     analyzeAudioBuffer,
     saveDebugAudio,
 };
